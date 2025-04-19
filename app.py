@@ -68,11 +68,14 @@ parameters_style = {
     'backgroundColor': '#f9f9f9'
 }
 
+WARNING_STATEMENT = "For educational purpose only, not to be considered financial advise! This application comes as is and may contain critical flawy. Always do your own research before taking ANY investment decision! No guaranties or waranties given, what so ever!"
+
 app = dash.Dash(__name__)
-app.title = "Historic USD/BTC Dashboard"
+app.title = "Historic USD/BTC Dashboard (educational purpose only, not to be considered financial advise!)"
 
 app.layout = html.Div([
-    html.H1("Bitcoin analytics", style={'textAlign': 'center', 'marginTop': '20px'}),
+    html.H1("Historic bitcoin price analytics", style={'textAlign': 'center', 'marginTop': '20px'}),
+    html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '20px'}),
     dcc.Tabs(id="tabs", value="analytics", children=[
         dcc.Tab(label="ANALYTICS", value="analytics", children=[
             html.Div([
@@ -157,7 +160,8 @@ app.layout = html.Div([
                 html.Br(), html.Br(),
             ], style=parameters_style)
         ])
-    ])
+    ]),
+    html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '20px'})
 ])
 
 # --------------------------

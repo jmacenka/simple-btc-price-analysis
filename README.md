@@ -16,7 +16,7 @@ Assuming that you have python3 installed and are on either a Linux or Mac system
 python3 -m pip install -r requirements.txt
 ```
 
-To install the requirements. Best to use a virtual environment like [pipenv]() or [venv](), do as you see fit.
+To install the requirements. Best to use a virtual environment like [pipenv](https://pypi.org/project/pipenv/) or [venv](https://docs.python.org/3/library/venv.html), do as you see fit.
 
 Then to launch the app locally run:
 
@@ -26,7 +26,7 @@ python3 app.py
 
 and visit:
 
-https://localhost:8050 to view the analysis which pulls the latest data from [yfinance]() for btc and calculates everything else locally.
+https://localhost:8050 to view the analysis which pulls the latest data from [yfinance](https://pypi.org/project/yfinance/) for btc and calculates everything else locally.
 
 Always do your own research! Nothing of this is financial advise. Stay safe and have fun!
 

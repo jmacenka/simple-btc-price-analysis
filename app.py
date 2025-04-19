@@ -68,7 +68,7 @@ parameters_style = {
     'backgroundColor': '#f9f9f9'
 }
 
-WARNING_STATEMENT = "For educational purpose only, not to be considered financial advise! This application comes as is and may contain critical flawy. Always do your own research before taking ANY investment decision! No guaranties or waranties given, what so ever!"
+WARNING_STATEMENT = "For educational purpose only, not to be considered financial advise! This application comes as is and may contain critical flaws. Always do your own research before taking ANY investment decision! No guaranties or warranties given, what so ever!"
 
 app = dash.Dash(__name__)
 app.title = "Historic USD/BTC Dashboard (educational purpose only, not to be considered financial advise!)"

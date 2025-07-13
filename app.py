@@ -576,4 +576,4 @@ Bubble size ∝ |Price − MA|, max size = 10× line thickness.
 # Run the App
 # --------------------------
 if __name__ == '__main__':
-    app.run_server(debug=False)
+    app.run(host='0.0.0.0',debug=False,port=8050)

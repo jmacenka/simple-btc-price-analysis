@@ -5,14 +5,14 @@
 # - Default RSI thresholds: Oversold=20, Overbought=80
 # - RSI zones reflect dynamic thresholds
 # - Price chart overlays buy/sell/long-term-buy signals
-#   * Buy signals show Return% & ARR% vs latest (since signal date)
-#   * Sell signals DO NOT show Return/ARR
+#   * Buy signals show Return% & CAGR% vs latest (since signal date)
+#   * Sell signals DO NOT show Return/CAGR
 # - Default view spans Long-term MA window (not full history)
 #
 # Updates in this version:
-# - Added "About" tab with explanation + resource links (educational-only emphasis)
-# - Human-readable power-law title (both plain & compact scientific for clarity)
-# - Kept prior fixes (robust hover date formatting; humanized durations)
+# - ARR renamed to CAGR (correct term) and calculation uses years = days/365
+# - Price chart line coloring by RSI removed (only single neutral line now)
+# - Kept prior fixes (robust hover date formatting; humanized durations; About tab)
 
 import io
 import dash
@@ -35,15 +35,19 @@ DAYS_PER_YEAR = 365
 DAYS_PER_MONTH = 30
 YFIT_MIN_PRICE = 100                   # hide nonsensical low fitted values
 
-PRICE_COLORS = {'overbought': 'red', 'oversold': 'green', 'neutral': 'blue'}
+# Colors
+PRICE_NEUTRAL_COLOR = 'blue'
+PRICE_MA_SHORT_COLOR = 'orange'
+PRICE_MA_LONG_COLOR = 'purple'
 RSI_LINE_COLORS = {'overbought': 'red', 'oversold': 'green', 'neutral': 'black'}
 
+# Hover templates
 HOVER_PRICE = "Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>"
 HOVER_BUY   = ("Date: %{customdata[0]}<br>"
                "Price: %{y:,.0f}<br>"
                "Held: %{customdata[3]}<br>"
                "Return: %{customdata[1]:.1f}%<br>"
-               "ARR: %{customdata[2]:.1f}%<extra></extra>")
+               "CAGR: %{customdata[2]:.1f}%<extra></extra>")
 HOVER_SELL  = ("Date: %{customdata}<br>"
                "Price: %{y:,.0f}<extra></extra>")
 HOVER_RSI   = "Date: %{customdata}<br>RSI: %{y:.0f}<extra></extra>"
@@ -157,16 +161,17 @@ def power_law_fit(days_series: pd.Series, price_series: pd.Series):
     return last, 0.0
 
 def add_perf_vs_latest(df_sig: pd.DataFrame, latest_date: pd.Timestamp, latest_price: float, price_col: str):
-    """Add ReturnPct/ARRPct/DaysHeldHuman for BUY signals only."""
+    """Add ReturnPct/CAGRPct/DaysHeldHuman for BUY signals only."""
     if df_sig.empty:
         df_sig['ReturnPct'] = []
-        df_sig['ARRPct'] = []
+        df_sig['CAGRPct'] = []
         df_sig['DaysHeldHuman'] = []
         return df_sig
     days = (latest_date - df_sig['Date']).dt.days.clip(lower=1)  # avoid /0
+    years = days / DAYS_PER_YEAR
     growth = (latest_price / df_sig[price_col]).replace(0, np.nan)
     df_sig['ReturnPct'] = ((growth - 1.0) * 100.0).round(2)
-    df_sig['ARRPct'] = ((growth ** (365.0 / days)) - 1.0).mul(100.0).round(2)
+    df_sig['CAGRPct'] = ((growth ** (1.0 / years)) - 1.0).mul(100.0).round(2)
     df_sig['DaysHeldHuman'] = days.astype(int).apply(humanize_days)
     return df_sig
 
@@ -189,7 +194,6 @@ def dates_for_hover(x_vals, use_loglog: bool, base_date: pd.Timestamp):
     """
     if use_loglog:
         return [(base_date + pd.Timedelta(days=int(x) - 1)).strftime('%Y-%m-%d') for x in np.asarray(x_vals)]
-
     x = pd.to_datetime(x_vals)
     if isinstance(x, pd.Series):
         return x.dt.strftime('%Y-%m-%d').tolist()
@@ -204,12 +208,10 @@ def fmt_power_law_readable(a: float, k: float) -> str:
       plus compact scientific in parentheses for clarity.
     - k with 2 decimal places.
     """
-    # Plain decimal for 'a'
     if a == 0 or (abs(a) < 1e-6 or abs(a) >= 1e6):
         a_plain = f"{a:.6g}"
     else:
         a_plain = f"{a:.6f}".rstrip('0').rstrip('.')
-    # Compact sci (a × 10^n)
     if a == 0:
         a_sci = "0"
     else:
@@ -261,7 +263,7 @@ This app visualizes historical Bitcoin prices and momentum using:
   Crossovers and distance from MAs help contextualize price moves.
 
 - **RSI (momentum):**  
-  - We color the RSI and price segments by regime:  
+  - We color the RSI by regime:  
     *oversold* (RSI < **{DEFAULT_RSI_OVERSOLD}**), *neutral*, *overbought* (RSI > **{DEFAULT_RSI_OVERBOUGHT}**).  
   - Shaded areas in the RSI panel mark these regions.
 
@@ -269,7 +271,7 @@ This app visualizes historical Bitcoin prices and momentum using:
   - **Short-term Buy**: RSI < oversold **and** Price < Short-term MA.  
   - **Short-term Sell**: RSI > overbought **and** Price > Short-term MA.  
   - **Long-term Buy**: RSI < oversold **and** Price < Long-term MA.  
-  Buy markers show **Return** and **ARR** (annualized rate of return) from that date to the latest point.
+  Buy markers show **Return** and **CAGR** (compound annual growth rate) from that date to the latest point.
 
 - **Predictions table:**  
   - Uses a **power-law** fit of price vs. time (days since first data point) to compute an indicative level per quarter.  
@@ -297,7 +299,7 @@ This app visualizes historical Bitcoin prices and momentum using:
   - Giovanni Santostasi – *Bitcoin Power Law Theory*: <https://giovannisantostasi.medium.com/the-bitcoin-power-law-theory-962dfaf99ee9>  
   - Fulgur Ventures – *Bitcoin Power Law Theory — Executive Summary*: <https://medium.com/%40fulgur.ventures/bitcoin-power-law-theory-executive-summary-report-837e6f00347e>
 
-- **ARR / CAGR concept:**  
+- **CAGR concept:**  
   - Investopedia – *Compound Annual Growth Rate (CAGR)*: <https://www.investopedia.com/terms/c/cagr.asp>
 
 - **Data source library:**  
@@ -522,7 +524,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     lt_buy = scale_marker(df[(df['RSI'] < rsi_os) & (df[price_col] < df['MA_200w'])].copy(),
                           'LT_dist', 'LT_marker_size', max_marker_size)
 
-    # Add performance ONLY for buy signals
+    # Add performance ONLY for buy signals (Return & CAGR)
     latest_price = df[price_col].iloc[-1]
     latest_date = df['Date'].iloc[-1]
     st_buy = add_perf_vs_latest(st_buy, latest_date, latest_price, price_col)
@@ -575,13 +577,13 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     def dates_h(xvals):
         return dates_for_hover(xvals, use_loglog, base_date)
 
-    # 1) Price - base & segmented by RSI class
+    # 1) Price - single neutral line (no RSI-class coloring on price)
     fig.add_trace(
         go.Scatter(
             x=df_chart[x_axis_col],
             y=df_chart[price_col],
             mode='lines',
-            line=dict(color=PRICE_COLORS['neutral'], width=price_line_thickness),
+            line=dict(color=PRICE_NEUTRAL_COLOR, width=price_line_thickness),
             showlegend=False,
             hovertemplate=HOVER_PRICE,
             customdata=dates_h(df_chart[x_axis_col])
@@ -589,28 +591,12 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
         row=1, col=1
     )
 
-    df_seg = df_chart.sort_values('Date').copy()
-    df_seg['Group'] = (df_seg['RSI_class'] != df_seg['RSI_class'].shift()).cumsum()
-    for _, g in df_seg.groupby('Group'):
-        fig.add_trace(
-            go.Scatter(
-                x=g[x_axis_col],
-                y=g[price_col],
-                mode='lines',
-                line=dict(color=PRICE_COLORS.get(g['RSI_class'].iloc[0], 'blue')),
-                showlegend=False,
-                hovertemplate=HOVER_PRICE,
-                customdata=dates_h(g[x_axis_col])
-            ),
-            row=1, col=1
-        )
-
     # 2) MAs
     x_all = df_chart[x_axis_col]
     fig.add_trace(
         go.Scatter(
             x=x_all, y=df_chart['MA_200d'], mode='lines',
-            line=dict(color='orange', width=price_line_thickness),
+            line=dict(color=PRICE_MA_SHORT_COLOR, width=price_line_thickness),
             name=f"Short-Term {fmt_duration_days(short_ma_window)} MA",
             hovertemplate=HOVER_PRICE,
             customdata=dates_h(x_all)
@@ -619,7 +605,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     fig.add_trace(
         go.Scatter(
             x=x_all, y=df_chart['MA_200w'], mode='lines',
-            line=dict(color='purple', width=price_line_thickness),
+            line=dict(color=PRICE_MA_LONG_COLOR, width=price_line_thickness),
             name=f"Long-Term {fmt_duration_days(long_ma_window*7)} MA",
             hovertemplate=HOVER_PRICE,
             customdata=dates_h(x_all)
@@ -642,7 +628,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
                     customdata=np.column_stack([
                         dates_h(df_cat[x_axis_col]),
                         df_cat['ReturnPct'].fillna(np.nan),
-                        df_cat['ARRPct'].fillna(np.nan),
+                        df_cat['CAGRPct'].fillna(np.nan),
                         df_cat['DaysHeldHuman'].fillna("")
                     ])
                 ), row=1, col=1
@@ -696,7 +682,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     # Y axis mode for price panel
     fig.update_yaxes(type="log" if axis_scale in ['log', 'loglog'] else "linear", row=1, col=1, autorange=True)
 
-    # 5) RSI panel with dynamic zones & segmented colors
+    # 5) RSI panel with dynamic zones & segmented colors (keep coloring here)
     fig.add_trace(
         go.Scatter(
             x=df_chart[x_axis_col], y=df_chart['RSI'], mode='lines',

@@ -1,8 +1,9 @@
-# Updated Dash app: supports BTC/EUR (default) and BTC/USD with a pair dropdown,
-# robust yfinance loading, and tolerant price-column detection.
+# Updated Dash app: adds a "Refresh Price-Data" button that re-fetches yfinance data
+# and updates all charts, tables, and date pickers accordingly. Also uses a dcc.Store
+# to hold the latest dataset.
 
 import dash
-from dash import dcc, html, Input, Output, dash_table
+from dash import dcc, html, Input, Output, dash_table, no_update
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import pandas as pd
@@ -86,9 +87,24 @@ def load_history():
     df = _flatten_columns(df)
     return df
 
+def df_from_store_json(data_json: str) -> pd.DataFrame:
+    """Rebuild a DataFrame from dcc.Store JSON (orient='split')."""
+    try:
+        df = pd.read_json(data_json, orient='split')
+        # Ensure Date column is datetime
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception:
+        # Fallback to a minimal non-empty DataFrame to keep UI alive
+        return pd.DataFrame({
+            "Date": pd.to_datetime(["2014-01-01"]),
+            "Open": [0.0], "High": [0.0], "Low": [0.0], "Close": [0.0], "Adj Close": [0.0], "Volume": [0]
+        })
+
 try:
     df_raw = load_history()
-except Exception as e:
+except Exception:
     # Minimal fallback to keep the layout from crashing
     df_raw = pd.DataFrame({
         "Date": pd.to_datetime(["2014-01-01"]),
@@ -107,7 +123,7 @@ Bubble size ∝ |Price − MA|, max size = 10× line thickness.
 """
 
 # --------------------------
-# App Layout with Two Tabs
+# App Layout with Two Tabs + Refresh
 # --------------------------
 
 parameters_style = {
@@ -123,9 +139,30 @@ WARNING_STATEMENT = "For educational purpose only, not to be considered financia
 app = dash.Dash(__name__)
 app.title = "Historic BTC Analytics (educational purpose only)"
 
+# Precompute initial dates from current df_raw
+_initial_min_date = pd.to_datetime(df_raw['Date']).min()
+_initial_max_date = pd.to_datetime(df_raw['Date']).max()
+
 app.layout = html.Div([
+    # Store for the latest dataset (populated at load and refreshed by button)
+    dcc.Store(
+        id='data-store',
+        data=df_raw.to_json(date_format='iso', orient='split')
+    ),
+
     html.H1("Historic bitcoin price analytics", style={'textAlign': 'center', 'marginTop': '20px'}),
-    html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '20px'}),
+    html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '10px'}),
+
+    # Refresh bar
+    html.Div([
+        html.Button("🔄 Refresh Price-Data", id='refresh-button', n_clicks=0, style={'marginRight': '10px'}),
+        html.Span(
+            id='refresh-status',
+            children=f"Data through {_initial_max_date.date()} — click to fetch latest.",
+            style={'color': '#555'}
+        )
+    ], style={'textAlign': 'center', 'margin': '10px'}),
+
     dcc.Tabs(id="tabs", value="analytics", children=[
         dcc.Tab(label="ANALYTICS", value="analytics", children=[
             html.Div([
@@ -159,10 +196,10 @@ app.layout = html.Div([
                     html.Div([
                         dcc.DatePickerRange(
                             id='date-range-picker',
-                            min_date_allowed=df_raw['Date'].min(),
-                            max_date_allowed=df_raw['Date'].max(),
-                            start_date=df_raw['Date'].min(),
-                            end_date=df_raw['Date'].max(),
+                            min_date_allowed=_initial_min_date,
+                            max_date_allowed=_initial_max_date,
+                            start_date=_initial_min_date,
+                            end_date=_initial_max_date,
                             display_format='YYYY-MM-DD'
                         )
                     ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top', 'textAlign': 'right'})
@@ -227,6 +264,44 @@ app.layout = html.Div([
 ])
 
 # --------------------------
+# Callback: Refresh Data (yfinance download)
+# --------------------------
+
+@app.callback(
+    [Output('data-store', 'data'),
+     Output('refresh-status', 'children')],
+    Input('refresh-button', 'n_clicks'),
+    prevent_initial_call=True
+)
+def refresh_data(n_clicks):
+    try:
+        df_new = load_history()
+        data_json = df_new.to_json(date_format='iso', orient='split')
+        status = (f"Refreshed at {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} — "
+                  f"data through {pd.to_datetime(df_new['Date']).max().date()}.")
+        return data_json, status
+    except Exception as e:
+        return no_update, f"Refresh failed: {e}"
+
+# --------------------------
+# Callback: Keep DatePicker in sync with (refreshed) data
+# --------------------------
+
+@app.callback(
+    [Output('date-range-picker', 'min_date_allowed'),
+     Output('date-range-picker', 'max_date_allowed'),
+     Output('date-range-picker', 'start_date'),
+     Output('date-range-picker', 'end_date')],
+    Input('data-store', 'data')
+)
+def sync_date_picker(data_json):
+    df = df_from_store_json(data_json)
+    df['Date'] = pd.to_datetime(df['Date'])
+    dmin = df['Date'].min()
+    dmax = df['Date'].max()
+    return dmin, dmax, dmin, dmax
+
+# --------------------------
 # Callback to Update Analytics
 # --------------------------
 
@@ -246,21 +321,26 @@ app.layout = html.Div([
      Input('rsi-overbought', 'value'),
      Input('rsi-oversold', 'value'),
      Input('marker-scale-factor', 'value'),
-     Input('price-line-thickness', 'value')]
+     Input('price-line-thickness', 'value'),
+     Input('data-store', 'data')]
 )
 def update_analytics(axis_scale, start_date, end_date, pair, price_field,
-                     short_ma_window, long_ma_window, rsi_ob, rsi_os, marker_scale, price_line_thickness):
+                     short_ma_window, long_ma_window, rsi_ob, rsi_os, marker_scale, price_line_thickness,
+                     data_json):
 
-    # Determine price column robustly.
-    price_col = get_price_column(price_field, pair, df_raw.columns)
-
-    # Work on a copy of raw data.
-    df_local = df_raw.copy()
+    # Load latest data from store
+    df_local = df_from_store_json(data_json).copy()
     df_local['Date'] = pd.to_datetime(df_local['Date'])
     df_local.sort_values('Date', inplace=True)
     df_local['Days'] = (df_local['Date'] - df_local['Date'].min()).dt.days + 1
 
+    # Determine price column robustly.
+    price_col = get_price_column(price_field, pair, df_local.columns)
+
     # Recalculate moving averages.
+    short_ma_window = int(short_ma_window or 180)
+    long_ma_window = int(long_ma_window or 208)
+
     df_local['MA_200d'] = df_local[price_col].rolling(window=short_ma_window).mean()
     df_week = df_local.set_index('Date').resample('W').last()
     df_week['MA_200w'] = df_week[price_col].rolling(window=long_ma_window).mean()
@@ -324,10 +404,13 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     valid = df_log[price_col] > 0
     x_fit_data = df_log.loc[valid, 'Days']
     y_fit_data = df_log.loc[valid, price_col]
-    log_x = np.log(x_fit_data)
-    log_y = np.log(y_fit_data)
-    slope_local, intercept_local = np.polyfit(log_x, log_y, 1)
-    a_local = np.exp(intercept_local)
+    if len(x_fit_data) >= 2:
+        log_x = np.log(x_fit_data)
+        log_y = np.log(y_fit_data)
+        slope_local, intercept_local = np.polyfit(log_x, log_y, 1)
+        a_local = np.exp(intercept_local)
+    else:
+        slope_local, a_local = 0.0, float(y_fit_data.iloc[-1] if len(y_fit_data) else 1.0)
 
     # Show predictions for a symmetric range of quarters centered on the current quarter.
     current_quarter = pd.Timestamp.today().to_period('Q').start_time
@@ -340,21 +423,21 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
     last_hist_date = df_local['Date'].max()
     for q_date in quarter_dates:
         days_since_start = (q_date - df_local['Date'].min()).days + 1
-        predicted_price = a_local * (days_since_start ** slope_local)
-        predicted_price_formatted = f"{predicted_price:,.0f}".replace(",", "'")
+        predicted_price = a_local * (days_since_start ** slope_local) if days_since_start > 0 else np.nan
+        predicted_price_formatted = f"{predicted_price:,.0f}".replace(",", "'") if np.isfinite(predicted_price) else ""
         if q_date <= last_hist_date:
             historic_row = df_local[df_local['Date'] <= q_date]
             historic_price = historic_row.iloc[-1][price_col] if not historic_row.empty else None
         else:
             historic_price = None
-        if historic_price is not None:
+        if (historic_price is not None) and np.isfinite(predicted_price) and predicted_price != 0:
             rel_div = 100 * (historic_price - predicted_price) / predicted_price
         else:
             rel_div = None
         quarter_label = f"{q_date.year} Q{q_date.quarter}"
         predicted_data.append({
             "Quarter": quarter_label,
-            "Days Since Start": days_since_start,
+            "Days Since Start": int(days_since_start),
             "Predicted Price": predicted_price_formatted,
             "Historic Price": f"{historic_price:,.0f}".replace(",", "'") if historic_price is not None else "",
             "Relative Divergence (%)": round(rel_div, 2) if rel_div is not None else ""
@@ -516,7 +599,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
         fig.update_xaxes(type="log", row=1, col=1)
         days_min = df_chart['Days'].min()
         days_max = df_chart['Days'].max()
-        tick_vals = np.logspace(np.log10(days_min), np.log10(days_max), num=10)
+        tick_vals = np.logspace(np.log10(days_min if days_min > 0 else 1), np.log10(days_max), num=10)
         tick_vals = np.unique(np.round(tick_vals).astype(int))
         tick_text = [(df_chart['Date'].min() + pd.Timedelta(days=val-1)).strftime('%Y-%m-%d') for val in tick_vals]
         fig.update_xaxes(tickvals=tick_vals, ticktext=tick_text, row=1, col=1)
@@ -548,7 +631,7 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
             customdata_group = [(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in group[x_axis_col]]
         else:
             customdata_group = group['Date'].dt.strftime('%Y-%m-%d')
-        x_vals_rsi = group[x_axis_col] if axis_scale == 'loglog' else group['Date']
+        x_vals_rsi = group[x_axis_col]
         fig.add_trace(
             go.Scatter(
                 x=x_vals_rsi,
@@ -600,17 +683,27 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
 
     # Update x-axis range (zoom) and auto-adapt Price y-axis to the subset within the current date-range.
     if start_date and end_date:
+        # Clip start/end dates to available range just in case
+        s_date = pd.to_datetime(start_date)
+        e_date = pd.to_datetime(end_date)
+        data_min = df_local['Date'].min()
+        data_max = df_local['Date'].max()
+        s_date = max(s_date, data_min)
+        e_date = min(e_date, data_max)
+
         if axis_scale == 'loglog':
             d0 = df_local['Date'].min()
-            start_day = (pd.to_datetime(start_date) - d0).days + 1
-            end_day = (pd.to_datetime(end_date) - d0).days + 1
+            start_day = (s_date - d0).days + 1
+            end_day = (e_date - d0).days + 1
+            start_day = max(start_day, 1)
+            end_day = max(end_day, start_day + 1)
             fig.update_xaxes(range=[np.log10(start_day), np.log10(end_day)], row=1, col=1)
             fig.update_xaxes(range=[np.log10(start_day), np.log10(end_day)], row=2, col=1)
             subset = df_local[(df_local['Days'] >= start_day) & (df_local['Days'] <= end_day)]
         else:
-            fig.update_xaxes(range=[start_date, end_date], row=1, col=1)
-            fig.update_xaxes(range=[start_date, end_date], row=2, col=1)
-            subset = df_local[(df_local['Date'] >= pd.to_datetime(start_date)) & (df_local['Date'] <= pd.to_datetime(end_date))]
+            fig.update_xaxes(range=[s_date, e_date], row=1, col=1)
+            fig.update_xaxes(range=[s_date, e_date], row=2, col=1)
+            subset = df_local[(df_local['Date'] >= s_date) & (df_local['Date'] <= e_date)]
         if not subset.empty:
             if axis_scale in ['log', 'loglog']:
                 log_ymin = np.log10(subset[price_col].min())

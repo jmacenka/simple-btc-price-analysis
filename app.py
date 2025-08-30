@@ -138,6 +138,7 @@ WARNING_STATEMENT = "For educational purpose only, not to be considered financia
 
 app = dash.Dash(__name__)
 app.title = "Historic BTC Analytics (educational purpose only)"
+server = app.server
 
 # Precompute initial dates from current df_raw
 _initial_min_date = pd.to_datetime(df_raw['Date']).min()
@@ -152,16 +153,6 @@ app.layout = html.Div([
 
     html.H1("Historic bitcoin price analytics", style={'textAlign': 'center', 'marginTop': '20px'}),
     html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '10px'}),
-
-    # Refresh bar
-    html.Div([
-        html.Button("🔄 Refresh Price-Data", id='refresh-button', n_clicks=0, style={'marginRight': '10px'}),
-        html.Span(
-            id='refresh-status',
-            children=f"Data through {_initial_max_date.date()} — click to fetch latest.",
-            style={'color': '#555'}
-        )
-    ], style={'textAlign': 'center', 'margin': '10px'}),
 
     dcc.Tabs(id="tabs", value="analytics", children=[
         dcc.Tab(label="ANALYTICS", value="analytics", children=[
@@ -223,6 +214,15 @@ app.layout = html.Div([
             ])
         ]),
         dcc.Tab(label="PARAMETERS", value="parameters", children=[
+            # Refresh bar
+            html.Div([
+                html.Button("🔄 Refresh Price-Data", id='refresh-button', n_clicks=0, style={'marginRight': '10px'}),
+                html.Span(
+                    id='refresh-status',
+                    children=f"Data through {_initial_max_date.date()} — click to fetch latest.",
+                    style={'color': '#555'}
+                )
+            ], style={'textAlign': 'center', 'margin': '10px'}),
             html.Div([
                 html.Label("Price Field:"),
                 dcc.Dropdown(
@@ -732,6 +732,8 @@ Bubble size ∝ |Price − MA|, max size = 10× line thickness × marker-scale.
 """
 
     return fig, df_predictions_new.to_dict('records'), quarterly_title, debug_text, dynamic_strategy
+
+
 
 # --------------------------
 # Run the App

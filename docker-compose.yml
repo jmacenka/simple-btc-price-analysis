@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  btc-analytics:
+    build: .
+    container_name: btc-analytics
+    ports:
+      - "8050:8050"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    # Uncomment to live-mount your local code during development:
+    # volumes:
+    #   - ./:/app

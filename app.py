@@ -1,7 +1,20 @@
-# Updated Dash app: adds a "Refresh Price-Data" button that re-fetches yfinance data
-# and updates all charts, tables, and date pickers accordingly. Also uses a dcc.Store
-# to hold the latest dataset.
+# Dash BTC Analytics App
+# - Tabs: About (first), Analytics (default open), Parameters
+# - Refresh price data button (yfinance)
+# - dcc.Store holds latest dataset
+# - Default RSI thresholds: Oversold=20, Overbought=80
+# - RSI zones reflect dynamic thresholds
+# - Price chart overlays buy/sell/long-term-buy signals
+#   * Buy signals show Return% & ARR% vs latest (since signal date)
+#   * Sell signals DO NOT show Return/ARR
+# - Default view spans Long-term MA window (not full history)
+#
+# Updates in this version:
+# - Added "About" tab with explanation + resource links (educational-only emphasis)
+# - Human-readable power-law title (both plain & compact scientific for clarity)
+# - Kept prior fixes (robust hover date formatting; humanized durations)
 
+import io
 import dash
 from dash import dcc, html, Input, Output, dash_table, no_update
 from plotly.subplots import make_subplots
@@ -10,12 +23,49 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 
-# --------------------------
-# Helper Functions
-# --------------------------
+# =========================
+# Constants (DRY)
+# =========================
+TICKERS = ["BTC-EUR", "BTC-USD"]
+DEFAULT_SHORT_TERM_DAYS = 180          # ~6 months
+DEFAULT_LONG_TERM_WEEKS = 208          # ~4 years
+DEFAULT_RSI_OVERBOUGHT = 80            # %
+DEFAULT_RSI_OVERSOLD = 20              # %
+DAYS_PER_YEAR = 365
+DAYS_PER_MONTH = 30
+YFIT_MIN_PRICE = 100                   # hide nonsensical low fitted values
 
-def compute_rsi(series, window=14):
-    """Compute the Relative Strength Index (RSI)."""
+PRICE_COLORS = {'overbought': 'red', 'oversold': 'green', 'neutral': 'blue'}
+RSI_LINE_COLORS = {'overbought': 'red', 'oversold': 'green', 'neutral': 'black'}
+
+HOVER_PRICE = "Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>"
+HOVER_BUY   = ("Date: %{customdata[0]}<br>"
+               "Price: %{y:,.0f}<br>"
+               "Held: %{customdata[3]}<br>"
+               "Return: %{customdata[1]:.1f}%<br>"
+               "ARR: %{customdata[2]:.1f}%<extra></extra>")
+HOVER_SELL  = ("Date: %{customdata}<br>"
+               "Price: %{y:,.0f}<extra></extra>")
+HOVER_RSI   = "Date: %{customdata}<br>RSI: %{y:.0f}<extra></extra>"
+
+WARNING_STATEMENT = (
+    "For educational purpose only, not to be considered financial advise! "
+    "This application comes as is and may contain critical flaws. Always do your own research "
+    "before taking ANY investment decision! No guaranties or warranties given, what so ever!"
+)
+
+PARAMETERS_STYLE = {
+    'border': '1px solid #ccc',
+    'padding': '20px',
+    'margin': '20px',
+    'borderRadius': '5px',
+    'backgroundColor': '#f9f9f9'
+}
+
+# =========================
+# Helpers
+# =========================
+def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -24,22 +74,29 @@ def compute_rsi(series, window=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def format_duration_in_days(days):
-    """Convert a number of days to the best unit: days, weeks, months, or years."""
+def fmt_duration_days(days: int) -> str:
     if days < 7:
         return f"{days} days"
-    elif days < 30:
-        weeks = days / 7
-        return f"{round(weeks)} weeks"
-    elif days < 365:
-        months = days / 30
-        return f"{round(months)} months"
-    else:
-        years = days / 365
-        return f"{round(years,1)} years"
+    if days < 30:
+        return f"{round(days/7)} weeks"
+    if days < DAYS_PER_YEAR:
+        return f"{round(days/30)} months"
+    return f"{round(days/DAYS_PER_YEAR,1)} years"
+
+def humanize_days(days: int) -> str:
+    """Convert integer days to 'Yy Mm Dd' (approx months=30d, years=365d)."""
+    days = int(max(0, days))
+    years = days // DAYS_PER_YEAR
+    rem = days % DAYS_PER_YEAR
+    months = rem // DAYS_PER_MONTH
+    d = rem % DAYS_PER_MONTH
+    parts = []
+    if years: parts.append(f"{years}y")
+    if months: parts.append(f"{months}m")
+    parts.append(f"{d}d")
+    return " ".join(parts)
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex columns from yfinance into 'Field_Ticker'."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [
             c0 if (isinstance(c1, str) and c1 == '') else f"{c0}_{c1}"
@@ -48,14 +105,10 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def get_price_column(price_field: str, ticker: str, columns: pd.Index) -> str:
-    """
-    Return a column name that matches the requested price_field and ticker across
-    the various shapes yfinance may return.
-    """
     candidates = [
-        f"{price_field}_{ticker}",     # group_by='column' flattened
-        f"{ticker}_{price_field}",     # group_by='ticker' flattened
-        price_field,                   # flat without ticker
+        f"{price_field}_{ticker}",
+        f"{ticker}_{price_field}",
+        price_field,
     ]
     if price_field == "Close":
         candidates.insert(1, f"Adj Close_{ticker}")
@@ -63,101 +116,225 @@ def get_price_column(price_field: str, ticker: str, columns: pd.Index) -> str:
     for c in candidates:
         if c in columns:
             return c
-    raise KeyError(
-        f"Price column for '{price_field}' & '{ticker}' not found. Available: {list(columns)}"
-    )
+    raise KeyError(f"Price column for '{price_field}' & '{ticker}' not found. Available: {list(columns)}")
 
-# --------------------------
-# Load Raw Data (BTC-EUR + BTC-USD, robust)
-# --------------------------
-
-TICKERS = ["BTC-EUR", "BTC-USD"]
-
-def load_history():
+def load_history() -> pd.DataFrame:
     df = yf.download(
         TICKERS,
         start="2014-01-01",
         progress=False,
-        group_by="column",   # (Field, Ticker) -> 'Field_Ticker' after flatten
+        group_by="column",
         threads=False,
     )
     if df is None or df.empty:
         raise RuntimeError("yfinance returned no data for BTC-EUR / BTC-USD")
-    df = df.reset_index()
-    df = _flatten_columns(df)
-    return df
+    return _flatten_columns(df.reset_index())
 
 def df_from_store_json(data_json: str) -> pd.DataFrame:
-    """Rebuild a DataFrame from dcc.Store JSON (orient='split')."""
     try:
-        df = pd.read_json(data_json, orient='split')
-        # Ensure Date column is datetime
+        # Use StringIO to avoid FutureWarning for literal JSON strings
+        df = pd.read_json(io.StringIO(data_json), orient='split')
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
         return df
     except Exception:
-        # Fallback to a minimal non-empty DataFrame to keep UI alive
         return pd.DataFrame({
             "Date": pd.to_datetime(["2014-01-01"]),
             "Open": [0.0], "High": [0.0], "Low": [0.0], "Close": [0.0], "Adj Close": [0.0], "Volume": [0]
         })
 
+def power_law_fit(days_series: pd.Series, price_series: pd.Series):
+    """Return (a, slope) for y = a * x^slope using log-log OLS; fallback sane defaults."""
+    valid = (days_series >= 365) & (price_series > 0)
+    x = days_series[valid]
+    y = price_series[valid]
+    if len(x) >= 2:
+        log_x = np.log(x)
+        log_y = np.log(y)
+        slope, intercept = np.polyfit(log_x, log_y, 1)
+        return float(np.exp(intercept)), float(slope)
+    last = float(y.iloc[-1]) if len(y) else 1.0
+    return last, 0.0
+
+def add_perf_vs_latest(df_sig: pd.DataFrame, latest_date: pd.Timestamp, latest_price: float, price_col: str):
+    """Add ReturnPct/ARRPct/DaysHeldHuman for BUY signals only."""
+    if df_sig.empty:
+        df_sig['ReturnPct'] = []
+        df_sig['ARRPct'] = []
+        df_sig['DaysHeldHuman'] = []
+        return df_sig
+    days = (latest_date - df_sig['Date']).dt.days.clip(lower=1)  # avoid /0
+    growth = (latest_price / df_sig[price_col]).replace(0, np.nan)
+    df_sig['ReturnPct'] = ((growth - 1.0) * 100.0).round(2)
+    df_sig['ARRPct'] = ((growth ** (365.0 / days)) - 1.0).mul(100.0).round(2)
+    df_sig['DaysHeldHuman'] = days.astype(int).apply(humanize_days)
+    return df_sig
+
+def scale_marker(df_cat: pd.DataFrame, dist_col: str, out_col: str, max_size: float) -> pd.DataFrame:
+    if df_cat.empty:
+        return df_cat
+    md = df_cat[dist_col].max()
+    df_cat[out_col] = (df_cat[dist_col] / md * max_size) if (md and md > 0) else (max_size/2.0)
+    return df_cat
+
+def marker_sizes(df_cat: pd.DataFrame) -> pd.Series:
+    cols = [c for c in df_cat.columns if c.endswith("_marker_size")]
+    return df_cat[cols[-1]] if cols else pd.Series([6]*len(df_cat), index=df_cat.index)
+
+def dates_for_hover(x_vals, use_loglog: bool, base_date: pd.Timestamp):
+    """
+    Return a list of 'YYYY-MM-DD' strings for hover.
+    - If use_loglog: x_vals are day numbers (array-like)
+    - Else: x_vals are datetimes (Series, DatetimeIndex, ndarray)
+    """
+    if use_loglog:
+        return [(base_date + pd.Timedelta(days=int(x) - 1)).strftime('%Y-%m-%d') for x in np.asarray(x_vals)]
+
+    x = pd.to_datetime(x_vals)
+    if isinstance(x, pd.Series):
+        return x.dt.strftime('%Y-%m-%d').tolist()
+    if isinstance(x, pd.DatetimeIndex):
+        return x.strftime('%Y-%m-%d').tolist()
+    return pd.Series(x).dt.strftime('%Y-%m-%d').tolist()
+
+def fmt_power_law_readable(a: float, k: float) -> str:
+    """
+    Format 'y = a · days^k' in a human-friendly way:
+    - shows a with up to 6 significant digits in plain decimal when reasonable,
+      plus compact scientific in parentheses for clarity.
+    - k with 2 decimal places.
+    """
+    # Plain decimal for 'a'
+    if a == 0 or (abs(a) < 1e-6 or abs(a) >= 1e6):
+        a_plain = f"{a:.6g}"
+    else:
+        a_plain = f"{a:.6f}".rstrip('0').rstrip('.')
+    # Compact sci (a × 10^n)
+    if a == 0:
+        a_sci = "0"
+    else:
+        exp = int(np.floor(np.log10(abs(a))))
+        mant = a / (10 ** exp)
+        a_sci = f"{mant:.3f}×10^{exp}"
+    return f"y = {a_plain} · (days)^{k:.2f}  ({a_sci})"
+
+# =========================
+# Data bootstrap
+# =========================
 try:
     df_raw = load_history()
 except Exception:
-    # Minimal fallback to keep the layout from crashing
     df_raw = pd.DataFrame({
         "Date": pd.to_datetime(["2014-01-01"]),
         "Open": [0.0], "High": [0.0], "Low": [0.0], "Close": [0.0], "Adj Close": [0.0], "Volume": [0]
     })
 
-# --------------------------
-# Default Trading Strategy Markdown
-# --------------------------
+_INITIAL_MIN_DATE = pd.to_datetime(df_raw['Date']).min()
+_INITIAL_MAX_DATE = pd.to_datetime(df_raw['Date']).max()
+_INITIAL_START_DATE = max(_INITIAL_MIN_DATE, _INITIAL_MAX_DATE - pd.to_timedelta(DEFAULT_LONG_TERM_WEEKS * 7, unit='D'))
 
-default_strategy_md = """
-**Trading Strategy:**  
-- **Short-term:** *Price* < MA₍200d₎ and RSI < 30 ⇒ Buy; *Price* > MA₍200d₎ and RSI > 70 ⇒ Sell.  
-- **Long-term:** *Price* < MA₍200w₎ and RSI < 30 ⇒ Buy.  
-Bubble size ∝ |Price − MA|, max size = 10× line thickness.
+# =========================
+# UI: About markdown (with links)
+# =========================
+ABOUT_MD = f"""
+# About this App
+
+**Purpose (Educational Only):**  
+This app visualizes historical Bitcoin prices and momentum using:
+- **Price chart** with **short-term** (e.g., 200 *days*) and **long-term** (e.g., 200 *weeks*) moving averages  
+- **RSI (Relative Strength Index)** to highlight *overbought*/*oversold* regimes  
+- Optional **log** and **log–log** views  
+- A simple **power-law** fit used to build a *quarterly* prediction table (illustrative only)
+
+> {WARNING_STATEMENT}
+
+## How to read the charts
+
+- **Axis scale:**  
+  - *Standard* shows prices on linear time/price axes.  
+  - *Log* sets the **price axis** to logarithmic (helpful across multiple orders of magnitude).  
+  - *Log–log* sets **both axes** to logarithmic; straight lines often indicate power-law relationships.
+
+- **Moving Averages:**  
+  - **Short-term MA** (default {DEFAULT_SHORT_TERM_DAYS}d) approximates ~{fmt_duration_days(DEFAULT_SHORT_TERM_DAYS)} trend.  
+  - **Long-term MA** (default {DEFAULT_LONG_TERM_WEEKS}w) approximates ~{fmt_duration_days(DEFAULT_LONG_TERM_WEEKS*7)} trend.  
+  Crossovers and distance from MAs help contextualize price moves.
+
+- **RSI (momentum):**  
+  - We color the RSI and price segments by regime:  
+    *oversold* (RSI < **{DEFAULT_RSI_OVERSOLD}**), *neutral*, *overbought* (RSI > **{DEFAULT_RSI_OVERBOUGHT}**).  
+  - Shaded areas in the RSI panel mark these regions.
+
+- **Signals (illustrative):**  
+  - **Short-term Buy**: RSI < oversold **and** Price < Short-term MA.  
+  - **Short-term Sell**: RSI > overbought **and** Price > Short-term MA.  
+  - **Long-term Buy**: RSI < oversold **and** Price < Long-term MA.  
+  Buy markers show **Return** and **ARR** (annualized rate of return) from that date to the latest point.
+
+- **Predictions table:**  
+  - Uses a **power-law** fit of price vs. time (days since first data point) to compute an indicative level per quarter.  
+  - Displays a *human-readable* formula header (coefficient and exponent).  
+  - Divergence column compares historical price (if available) to the model on that date.  
+  - **Note:** This is *not* a forecast—purely an educational visualization of a simple curve-fit.
+
+## Good background resources
+
+- **RSI:**  
+  - Investopedia – *Relative Strength Index (RSI)*: <https://www.investopedia.com/terms/r/rsi.asp>  
+  - Investopedia – *RSI buy/sell signals*: <https://www.investopedia.com/articles/active-trading/042114/overbought-or-oversold-use-relative-strength-index-find-out.asp>
+
+- **Moving Averages:**  
+  - Investopedia – *Simple Moving Average (SMA)*: <https://www.investopedia.com/terms/s/sma.asp>  
+  - Investopedia – *Why the 200-day SMA?*: <https://www.investopedia.com/ask/answers/013015/why-200-simple-moving-average-sma-so-common-traders-and-analysts.asp>  
+  - Investopedia – *Moving Average (MA)* overview: <https://www.investopedia.com/terms/m/movingaverage.asp>
+
+- **Logarithmic & Log–Log:**  
+  - Wikipedia – *Logarithmic scale*: <https://en.wikipedia.org/wiki/Logarithmic_scale>  
+  - Wikipedia – *Log–log plot*: <https://en.wikipedia.org/wiki/Log%E2%80%93log_plot>
+
+- **Power laws & Bitcoin context:**  
+  - Wikipedia – *Power law* (general): <https://en.wikipedia.org/wiki/Power_law>  
+  - Giovanni Santostasi – *Bitcoin Power Law Theory*: <https://giovannisantostasi.medium.com/the-bitcoin-power-law-theory-962dfaf99ee9>  
+  - Fulgur Ventures – *Bitcoin Power Law Theory — Executive Summary*: <https://medium.com/%40fulgur.ventures/bitcoin-power-law-theory-executive-summary-report-837e6f00347e>
+
+- **ARR / CAGR concept:**  
+  - Investopedia – *Compound Annual Growth Rate (CAGR)*: <https://www.investopedia.com/terms/c/cagr.asp>
+
+- **Data source library:**  
+  - yfinance docs: <https://ranaroussi.github.io/yfinance/>
+
+Again: **This app is for education only. It is not investment advice.**
 """
 
-# --------------------------
-# App Layout with Two Tabs + Refresh
-# --------------------------
-
-parameters_style = {
-    'border': '1px solid #ccc',
-    'padding': '20px',
-    'margin': '20px',
-    'borderRadius': '5px',
-    'backgroundColor': '#f9f9f9'
-}
-
-WARNING_STATEMENT = "For educational purpose only, not to be considered financial advise! This application comes as is and may contain critical flaws. Always do your own research before taking ANY investment decision! No guaranties or warranties given, what so ever!"
+# =========================
+# UI
+# =========================
+default_strategy_md = f"""
+**Trading Strategy:**  
+- **Short-term:** *Price* < MA₍200d₎ and RSI < {DEFAULT_RSI_OVERSOLD} ⇒ Buy; *Price* > MA₍200d₎ and RSI > {DEFAULT_RSI_OVERBOUGHT} ⇒ Sell.  
+- **Long-term:** *Price* < MA₍200w₎ and RSI < {DEFAULT_RSI_OVERSOLD} ⇒ Buy.  
+Bubble size ∝ |Price − MA|, max size = 10× line thickness.
+"""
 
 app = dash.Dash(__name__)
 app.title = "Historic BTC Analytics (educational purpose only)"
 server = app.server
 
-# Precompute initial dates from current df_raw
-_initial_min_date = pd.to_datetime(df_raw['Date']).min()
-_initial_max_date = pd.to_datetime(df_raw['Date']).max()
-
+# Tabs: About (first), Analytics, Parameters; default value="analytics"
 app.layout = html.Div([
-    # Store for the latest dataset (populated at load and refreshed by button)
-    dcc.Store(
-        id='data-store',
-        data=df_raw.to_json(date_format='iso', orient='split')
-    ),
+    dcc.Store(id='data-store', data=df_raw.to_json(date_format='iso', orient='split')),
 
     html.H1("Historic bitcoin price analytics", style={'textAlign': 'center', 'marginTop': '20px'}),
     html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '10px'}),
 
     dcc.Tabs(id="tabs", value="analytics", children=[
+        dcc.Tab(label="ABOUT", value="about", children=[
+            html.Div([
+                dcc.Markdown(ABOUT_MD, link_target="_blank", style={'maxWidth': '900px', 'margin': '0 auto', 'padding': '20px'})
+            ])
+        ]),
         dcc.Tab(label="ANALYTICS", value="analytics", children=[
             html.Div([
-                # Top row: Axis Scale, Pair, Date Range Picker.
                 html.Div([
                     html.Div([
                         html.Label("Axis Scale:"),
@@ -180,17 +357,17 @@ app.layout = html.Div([
                                 {'label': 'BTC/EUR', 'value': 'BTC-EUR'},
                                 {'label': 'BTC/USD', 'value': 'BTC-USD'},
                             ],
-                            value='BTC-EUR',  # Default to EUR pair
+                            value='BTC-EUR',
                             clearable=False
                         )
                     ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top'}),
                     html.Div([
                         dcc.DatePickerRange(
                             id='date-range-picker',
-                            min_date_allowed=_initial_min_date,
-                            max_date_allowed=_initial_max_date,
-                            start_date=_initial_min_date,
-                            end_date=_initial_max_date,
+                            min_date_allowed=_INITIAL_MIN_DATE,
+                            max_date_allowed=_INITIAL_MAX_DATE,
+                            start_date=_INITIAL_START_DATE,
+                            end_date=_INITIAL_MAX_DATE,
                             display_format='YYYY-MM-DD'
                         )
                     ], style={'width': '32%', 'display': 'inline-block', 'verticalAlign': 'top', 'textAlign': 'right'})
@@ -214,12 +391,11 @@ app.layout = html.Div([
             ])
         ]),
         dcc.Tab(label="PARAMETERS", value="parameters", children=[
-            # Refresh bar
             html.Div([
                 html.Button("🔄 Refresh Price-Data", id='refresh-button', n_clicks=0, style={'marginRight': '10px'}),
                 html.Span(
                     id='refresh-status',
-                    children=f"Data through {_initial_max_date.date()} — click to fetch latest.",
+                    children=f"Data through {_INITIAL_MAX_DATE.date()} — click to fetch latest.",
                     style={'color': '#555'}
                 )
             ], style={'textAlign': 'center', 'margin': '10px'}),
@@ -227,29 +403,22 @@ app.layout = html.Div([
                 html.Label("Price Field:"),
                 dcc.Dropdown(
                     id='price-field',
-                    options=[
-                        {'label': 'Close', 'value': 'Close'},
-                        {'label': 'High', 'value': 'High'},
-                        {'label': 'Low', 'value': 'Low'},
-                        {'label': 'Open', 'value': 'Open'}
-                    ],
+                    options=[{'label': x, 'value': x} for x in ['Close', 'High', 'Low', 'Open']],
                     value='Close',
                     clearable=False
                 ),
                 html.Br(),
                 html.Label("Short-term MA Window (days):"),
-                # Default short-term MA set to 180 days (~6 months).
-                dcc.Input(id='short-term-ma-window', type='number', value=180),
+                dcc.Input(id='short-term-ma-window', type='number', value=DEFAULT_SHORT_TERM_DAYS),
                 html.Br(), html.Br(),
                 html.Label("Long-term MA Window (weeks):"),
-                # Default long-term MA set to 208 weeks (~4 years).
-                dcc.Input(id='long-term-ma-window', type='number', value=208),
+                dcc.Input(id='long-term-ma-window', type='number', value=DEFAULT_LONG_TERM_WEEKS),
                 html.Br(), html.Br(),
                 html.Label("RSI Overbought Threshold:"),
-                dcc.Input(id='rsi-overbought', type='number', value=70),
+                dcc.Input(id='rsi-overbought', type='number', value=DEFAULT_RSI_OVERBOUGHT),
                 html.Br(), html.Br(),
                 html.Label("RSI Oversold Threshold:"),
-                dcc.Input(id='rsi-oversold', type='number', value=30),
+                dcc.Input(id='rsi-oversold', type='number', value=DEFAULT_RSI_OVERSOLD),
                 html.Br(), html.Br(),
                 html.Label("Marker Scale Factor:"),
                 dcc.Input(id='marker-scale-factor', type='number', value=1),
@@ -257,16 +426,15 @@ app.layout = html.Div([
                 html.Label("Historic Price Line Thickness:"),
                 dcc.Input(id='price-line-thickness', type='number', value=2),
                 html.Br(), html.Br(),
-            ], style=parameters_style)
+            ], style=PARAMETERS_STYLE)
         ])
     ]),
     html.P(WARNING_STATEMENT, style={'textAlign': 'center', 'marginTop': '20px'})
 ])
 
-# --------------------------
-# Callback: Refresh Data (yfinance download)
-# --------------------------
-
+# =========================
+# Callbacks
+# =========================
 @app.callback(
     [Output('data-store', 'data'),
      Output('refresh-status', 'children')],
@@ -283,27 +451,21 @@ def refresh_data(n_clicks):
     except Exception as e:
         return no_update, f"Refresh failed: {e}"
 
-# --------------------------
-# Callback: Keep DatePicker in sync with (refreshed) data
-# --------------------------
-
 @app.callback(
     [Output('date-range-picker', 'min_date_allowed'),
      Output('date-range-picker', 'max_date_allowed'),
      Output('date-range-picker', 'start_date'),
      Output('date-range-picker', 'end_date')],
-    Input('data-store', 'data')
+    [Input('data-store', 'data'),
+     Input('long-term-ma-window', 'value')]
 )
-def sync_date_picker(data_json):
+def sync_date_picker(data_json, long_term_weeks):
     df = df_from_store_json(data_json)
     df['Date'] = pd.to_datetime(df['Date'])
-    dmin = df['Date'].min()
-    dmax = df['Date'].max()
-    return dmin, dmax, dmin, dmax
-
-# --------------------------
-# Callback to Update Analytics
-# --------------------------
+    dmin, dmax = df['Date'].min(), df['Date'].max()
+    lt_weeks = int(long_term_weeks or DEFAULT_LONG_TERM_WEEKS)
+    start = max(dmin, dmax - pd.to_timedelta(lt_weeks * 7, unit='D'))
+    return dmin, dmax, start, dmax
 
 @app.callback(
     [Output('combined-chart', 'figure'),
@@ -328,351 +490,245 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
                      short_ma_window, long_ma_window, rsi_ob, rsi_os, marker_scale, price_line_thickness,
                      data_json):
 
-    # Load latest data from store
-    df_local = df_from_store_json(data_json).copy()
-    df_local['Date'] = pd.to_datetime(df_local['Date'])
-    df_local.sort_values('Date', inplace=True)
-    df_local['Days'] = (df_local['Date'] - df_local['Date'].min()).dt.days + 1
+    # ---- Data prep
+    df = df_from_store_json(data_json).copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.sort_values('Date', inplace=True)
+    df['Days'] = (df['Date'] - df['Date'].min()).dt.days + 1
 
-    # Determine price column robustly.
-    price_col = get_price_column(price_field, pair, df_local.columns)
+    price_col = get_price_column(price_field, pair, df.columns)
 
-    # Recalculate moving averages.
-    short_ma_window = int(short_ma_window or 180)
-    long_ma_window = int(long_ma_window or 208)
+    short_ma_window = int(short_ma_window or DEFAULT_SHORT_TERM_DAYS)
+    long_ma_window = int(long_ma_window or DEFAULT_LONG_TERM_WEEKS)
 
-    df_local['MA_200d'] = df_local[price_col].rolling(window=short_ma_window).mean()
-    df_week = df_local.set_index('Date').resample('W').last()
+    df['MA_200d'] = df[price_col].rolling(window=short_ma_window).mean()
+    df_week = df.set_index('Date').resample('W').last()
     df_week['MA_200w'] = df_week[price_col].rolling(window=long_ma_window).mean()
-    ma200w_series = df_week['MA_200w'].reindex(df_local['Date'], method='ffill')
-    df_local['MA_200w'] = ma200w_series.values
+    df['MA_200w'] = df_week['MA_200w'].reindex(df['Date'], method='ffill').values
 
-    # Recalculate RSI.
-    df_local['RSI'] = compute_rsi(df_local[price_col])
-    df_local['RSI_class'] = np.where(df_local['RSI'] > rsi_ob, 'overbought',
-                              np.where(df_local['RSI'] < rsi_os, 'oversold', 'neutral'))
+    df['RSI'] = compute_rsi(df[price_col])
+    df['RSI_class'] = np.where(df['RSI'] > rsi_ob, 'overbought',
+                        np.where(df['RSI'] < rsi_os, 'oversold', 'neutral'))
 
-    # Define color dictionaries.
-    price_colors = {'overbought': 'red', 'oversold': 'green', 'neutral': 'blue'}
-    rsi_line_colors = {'overbought': 'red', 'oversold': 'green', 'neutral': 'black'}
-
-    # Marker size (respect user's marker-scale-factor).
     max_marker_size = max(1, (price_line_thickness or 1)) * 10 * (marker_scale or 1)
 
-    # Compute distances.
-    df_local['ST_dist'] = (df_local[price_col] - df_local['MA_200d']).abs()
-    df_local['LT_dist'] = (df_local[price_col] - df_local['MA_200w']).abs()
+    df['ST_dist'] = (df[price_col] - df['MA_200d']).abs()
+    df['LT_dist'] = (df[price_col] - df['MA_200w']).abs()
 
-    def scale_marker_category(df_cat, dist_col, size_col):
-        if not df_cat.empty:
-            max_dist = df_cat[dist_col].max()
-            if max_dist and max_dist > 0:
-                df_cat[size_col] = (df_cat[dist_col] / max_dist) * max_marker_size
-            else:
-                df_cat[size_col] = max_marker_size / 2.0
-        return df_cat
+    st_buy = scale_marker(df[(df['RSI'] < rsi_os) & (df[price_col] < df['MA_200d'])].copy(),
+                          'ST_dist', 'ST_marker_size', max_marker_size)
+    st_sell = scale_marker(df[(df['RSI'] > rsi_ob) & (df[price_col] > df['MA_200d'])].copy(),
+                           'ST_dist', 'ST_marker_size', max_marker_size)
+    lt_buy = scale_marker(df[(df['RSI'] < rsi_os) & (df[price_col] < df['MA_200w'])].copy(),
+                          'LT_dist', 'LT_marker_size', max_marker_size)
 
-    short_term_buy = df_local[(df_local['RSI'] < rsi_os) & (df_local[price_col] < df_local['MA_200d'])].copy()
-    short_term_sell = df_local[(df_local['RSI'] > rsi_ob) & (df_local[price_col] > df_local['MA_200d'])].copy()
-    long_term_buy = df_local[(df_local['RSI'] < rsi_os) & (df_local[price_col] < df_local['MA_200w'])].copy()
+    # Add performance ONLY for buy signals
+    latest_price = df[price_col].iloc[-1]
+    latest_date = df['Date'].iloc[-1]
+    st_buy = add_perf_vs_latest(st_buy, latest_date, latest_price, price_col)
+    lt_buy = add_perf_vs_latest(lt_buy, latest_date, latest_price, price_col)
 
-    short_term_buy = scale_marker_category(short_term_buy, 'ST_dist', 'ST_marker_size')
-    short_term_sell = scale_marker_category(short_term_sell, 'ST_dist', 'ST_marker_size')
-    long_term_buy = scale_marker_category(long_term_buy, 'LT_dist', 'LT_marker_size')
+    # Choose x axis mode
+    use_loglog = (axis_scale == 'loglog')
+    df_chart = df[df['Days'] >= 365].copy() if use_loglog else df.copy()
+    x_axis_col = 'Days' if use_loglog else 'Date'
+    base_date = df['Date'].min()
 
-    # Use full data for computing indicators.
-    df_chart = df_local.copy()
-    if axis_scale == 'loglog':
-        df_chart = df_chart[df_chart['Days'] >= 365].copy()
+    # Power-law fit
+    a_fit, slope_fit = power_law_fit(df['Days'], df[price_col])
 
-    x_axis_col = 'Date'
-    if axis_scale == 'loglog':
-        x_axis_col = 'Days'
-
-    base_date = df_local['Date'].min()
-    if axis_scale == 'loglog':
-        customdata_price = [(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in df_chart[x_axis_col]]
-        customdata_rsi = customdata_price
-    else:
-        customdata_price = df_chart['Date'].dt.strftime('%Y-%m-%d')
-        customdata_rsi = customdata_price
-
-    # ------------------------------
-    # Compute Power-Law Best-Fit for Predictions.
-    # ------------------------------
-    df_log = df_local[df_local['Days'] >= 365]
-    valid = df_log[price_col] > 0
-    x_fit_data = df_log.loc[valid, 'Days']
-    y_fit_data = df_log.loc[valid, price_col]
-    if len(x_fit_data) >= 2:
-        log_x = np.log(x_fit_data)
-        log_y = np.log(y_fit_data)
-        slope_local, intercept_local = np.polyfit(log_x, log_y, 1)
-        a_local = np.exp(intercept_local)
-    else:
-        slope_local, a_local = 0.0, float(y_fit_data.iloc[-1] if len(y_fit_data) else 1.0)
-
-    # Show predictions for a symmetric range of quarters centered on the current quarter.
-    current_quarter = pd.Timestamp.today().to_period('Q').start_time
-    num_quarters_each_side = 4
-    start_table = current_quarter - pd.DateOffset(months=3*num_quarters_each_side)
-    end_table = current_quarter + pd.DateOffset(months=3*num_quarters_each_side)
-    quarter_dates = pd.date_range(start=start_table, end=end_table, freq='QS')
-
-    predicted_data = []
-    last_hist_date = df_local['Date'].max()
-    for q_date in quarter_dates:
-        days_since_start = (q_date - df_local['Date'].min()).days + 1
-        predicted_price = a_local * (days_since_start ** slope_local) if days_since_start > 0 else np.nan
-        predicted_price_formatted = f"{predicted_price:,.0f}".replace(",", "'") if np.isfinite(predicted_price) else ""
-        if q_date <= last_hist_date:
-            historic_row = df_local[df_local['Date'] <= q_date]
-            historic_price = historic_row.iloc[-1][price_col] if not historic_row.empty else None
+    # Quarterly prediction table (±4 quarters around current quarter)
+    current_q = pd.Timestamp.today().to_period('Q').start_time
+    q_dates = pd.date_range(start=current_q - pd.DateOffset(months=12),
+                            end=current_q + pd.DateOffset(months=12),
+                            freq='QS')
+    preds = []
+    last_hist = df['Date'].max()
+    d0 = df['Date'].min()
+    for qd in q_dates:
+        days_since_start = (qd - d0).days + 1
+        pred_price = a_fit * (days_since_start ** slope_fit) if days_since_start > 0 else np.nan
+        pred_str = f"{pred_price:,.0f}".replace(",", "'") if np.isfinite(pred_price) else ""
+        if qd <= last_hist:
+            hist_row = df[df['Date'] <= qd]
+            hist_price = hist_row.iloc[-1][price_col] if not hist_row.empty else None
         else:
-            historic_price = None
-        if (historic_price is not None) and np.isfinite(predicted_price) and predicted_price != 0:
-            rel_div = 100 * (historic_price - predicted_price) / predicted_price
-        else:
-            rel_div = None
-        quarter_label = f"{q_date.year} Q{q_date.quarter}"
-        predicted_data.append({
-            "Quarter": quarter_label,
+            hist_price = None
+        rel_div = (100 * (hist_price - pred_price) / pred_price) if (hist_price is not None and np.isfinite(pred_price) and pred_price != 0) else None
+        preds.append({
+            "Quarter": f"{qd.year} Q{qd.quarter}",
             "Days Since Start": int(days_since_start),
-            "Predicted Price": predicted_price_formatted,
-            "Historic Price": f"{historic_price:,.0f}".replace(",", "'") if historic_price is not None else "",
+            "Predicted Price": pred_str,
+            "Historic Price": f"{hist_price:,.0f}".replace(",", "'") if hist_price is not None else "",
             "Relative Divergence (%)": round(rel_div, 2) if rel_div is not None else ""
         })
-    df_predictions_new = pd.DataFrame(predicted_data)
+    df_preds = pd.DataFrame(preds)
 
-    # ------------------------------
-    # Build Combined Chart (Price & RSI)
-    # ------------------------------
+    # =========================
+    # Build Figure
+    # =========================
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.02, row_heights=[0.7, 0.3],
                         subplot_titles=("Price Chart", "RSI"))
 
-    # Base trace for Price using the neutral color.
+    # Helper for hover dates
+    def dates_h(xvals):
+        return dates_for_hover(xvals, use_loglog, base_date)
+
+    # 1) Price - base & segmented by RSI class
     fig.add_trace(
         go.Scatter(
             x=df_chart[x_axis_col],
             y=df_chart[price_col],
             mode='lines',
-            line=dict(color=price_colors['neutral'], width=price_line_thickness),
+            line=dict(color=PRICE_COLORS['neutral'], width=price_line_thickness),
             showlegend=False,
-            hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-            customdata=customdata_price
+            hovertemplate=HOVER_PRICE,
+            customdata=dates_h(df_chart[x_axis_col])
         ),
         row=1, col=1
     )
 
-    # Segmented Price trace.
-    df_price = df_chart.sort_values('Date').copy()
-    df_price['Group'] = (df_price['RSI_class'] != df_price['RSI_class'].shift()).cumsum()
-    for _, group in df_price.groupby('Group'):
-        x_vals = group[x_axis_col]
-        customdata_group = ([(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in group[x_axis_col]]
-                            if axis_scale=='loglog' else group['Date'].dt.strftime('%Y-%m-%d'))
+    df_seg = df_chart.sort_values('Date').copy()
+    df_seg['Group'] = (df_seg['RSI_class'] != df_seg['RSI_class'].shift()).cumsum()
+    for _, g in df_seg.groupby('Group'):
         fig.add_trace(
             go.Scatter(
-                x=x_vals,
-                y=group[price_col],
+                x=g[x_axis_col],
+                y=g[price_col],
                 mode='lines',
-                line=dict(color=price_colors.get(group['RSI_class'].iloc[0], 'blue')),
+                line=dict(color=PRICE_COLORS.get(g['RSI_class'].iloc[0], 'blue')),
                 showlegend=False,
-                hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-                customdata=customdata_group
+                hovertemplate=HOVER_PRICE,
+                customdata=dates_h(g[x_axis_col])
             ),
             row=1, col=1
         )
 
-    x_vals_all = df_chart[x_axis_col]
-    short_label = f"Short-Term {format_duration_in_days(short_ma_window)} MA"
-    long_label = f"Long-Term {format_duration_in_days(long_ma_window * 7)} MA"
-
+    # 2) MAs
+    x_all = df_chart[x_axis_col]
     fig.add_trace(
         go.Scatter(
-            x=x_vals_all,
-            y=df_chart['MA_200d'],
-            mode='lines',
+            x=x_all, y=df_chart['MA_200d'], mode='lines',
             line=dict(color='orange', width=price_line_thickness),
-            name=short_label,
-            hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-            customdata=customdata_price
-        ),
-        row=1, col=1
+            name=f"Short-Term {fmt_duration_days(short_ma_window)} MA",
+            hovertemplate=HOVER_PRICE,
+            customdata=dates_h(x_all)
+        ), row=1, col=1
     )
     fig.add_trace(
         go.Scatter(
-            x=x_vals_all,
-            y=df_chart['MA_200w'],
-            mode='lines',
+            x=x_all, y=df_chart['MA_200w'], mode='lines',
             line=dict(color='purple', width=price_line_thickness),
-            name=long_label,
-            hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-            customdata=customdata_price
-        ),
-        row=1, col=1
+            name=f"Long-Term {fmt_duration_days(long_ma_window*7)} MA",
+            hovertemplate=HOVER_PRICE,
+            customdata=dates_h(x_all)
+        ), row=1, col=1
     )
 
-    # Overlay opportunity bubbles (long-term sell removed).
-    bubble_traces = [
-        (short_term_buy, 'Short-term Buy', 'lightgreen', 'circle'),
-        (short_term_sell, 'Short-term Sell', 'lightcoral', 'circle'),
-        (long_term_buy, 'Long-term Buy', 'green', 'square')
-    ]
-    for df_cat, name, color, symbol in bubble_traces:
+    # 3) Signal bubbles
+    # Buy bubbles with performance in hover (humanized duration)
+    for df_cat, name, color, symbol in [
+        (st_buy, 'Short-term Buy', 'lightgreen', 'circle'),
+        (lt_buy, 'Long-term Buy', 'green', 'square'),
+    ]:
         if not df_cat.empty:
-            df_cat_chart = df_cat.copy()
-            if axis_scale == 'loglog':
-                df_cat_chart = df_cat_chart[df_cat_chart['Days'] >= 365]
-                customdata_bubble = [(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in df_cat_chart[x_axis_col]]
-            else:
-                customdata_bubble = df_cat_chart['Date'].dt.strftime('%Y-%m-%d')
-            # pick last created marker-size column
-            size_col = [c for c in df_cat_chart.columns if c.endswith("_marker_size")]
-            size_series = df_cat_chart[size_col[-1]] if size_col else pd.Series([6]*len(df_cat_chart), index=df_cat_chart.index)
             fig.add_trace(
                 go.Scatter(
-                    x=df_cat_chart[x_axis_col],
-                    y=df_cat_chart[price_col],
-                    mode='markers',
-                    marker=dict(
-                        size=size_series,
-                        color=color,
-                        opacity=1.0,
-                        symbol=symbol
-                    ),
+                    x=df_cat[x_axis_col], y=df_cat[price_col], mode='markers',
+                    marker=dict(size=marker_sizes(df_cat), color=color, opacity=1.0, symbol=symbol),
                     name=name,
-                    hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-                    customdata=customdata_bubble
-                ),
-                row=1, col=1
+                    hovertemplate=HOVER_BUY,
+                    customdata=np.column_stack([
+                        dates_h(df_cat[x_axis_col]),
+                        df_cat['ReturnPct'].fillna(np.nan),
+                        df_cat['ARRPct'].fillna(np.nan),
+                        df_cat['DaysHeldHuman'].fillna("")
+                    ])
+                ), row=1, col=1
             )
 
-    # Overlay power-law fit line.
-    if axis_scale == 'loglog':
-        x_min = df_chart['Days'].min()
-        x_max = df_chart['Days'].max()
-        x_line = np.linspace(x_min, x_max, 100)
-        y_line = a_local * (x_line ** slope_local)
-        mask = y_line >= 100
-        x_line = x_line[mask]
-        y_line = y_line[mask]
-        customdata_fit = [(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in x_line]
+    # Sell bubbles WITHOUT performance (as requested)
+    if not st_sell.empty:
         fig.add_trace(
             go.Scatter(
-                x=x_line,
-                y=y_line,
-                mode='lines',
-                line=dict(color='gray', dash='dash'),
-                name='Power-Law Fit',
-                hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-                customdata=customdata_fit
-            ),
-            row=1, col=1
-        )
-    else:
-        x_min = df_local['Days'].min()
-        x_max = df_local['Days'].max()
-        x_line = np.linspace(x_min, x_max, 100)
-        y_line = a_local * (x_line ** slope_local)
-        mask = y_line >= 100
-        x_line = x_line[mask]
-        y_line = y_line[mask]
-        date_min = df_local['Date'].min()
-        x_line_dates = [date_min + pd.Timedelta(days=int(x)-1) for x in x_line]
-        customdata_fit = [d.strftime('%Y-%m-%d') for d in x_line_dates]
-        fig.add_trace(
-            go.Scatter(
-                x=x_line_dates,
-                y=y_line,
-                mode='lines',
-                line=dict(color='gray', dash='dash'),
-                name='Power-Law Fit',
-                hovertemplate="Date: %{customdata}<br>Price: %{y:,.0f}<extra></extra>",
-                customdata=customdata_fit
-            ),
-            row=1, col=1
+                x=st_sell[x_axis_col], y=st_sell[price_col], mode='markers',
+                marker=dict(size=marker_sizes(st_sell), color='lightcoral', opacity=1.0, symbol='circle'),
+                name='Short-term Sell',
+                hovertemplate=HOVER_SELL,
+                customdata=dates_h(st_sell[x_axis_col])
+            ), row=1, col=1
         )
 
-    if axis_scale == 'loglog':
+    # 4) Power-law fit line
+    if use_loglog:
+        x_line = np.linspace(df_chart['Days'].min(), df_chart['Days'].max(), 100)
+        y_line = a_fit * (x_line ** slope_fit)
+        mask = y_line >= YFIT_MIN_PRICE
+        x_line = x_line[mask]; y_line = y_line[mask]
+        fig.add_trace(
+            go.Scatter(
+                x=x_line, y=y_line, mode='lines',
+                line=dict(color='gray', dash='dash'),
+                name='Power-Law Fit',
+                hovertemplate=HOVER_PRICE,
+                customdata=dates_h(x_line)
+            ), row=1, col=1
+        )
         fig.update_xaxes(type="log", row=1, col=1)
-        days_min = df_chart['Days'].min()
-        days_max = df_chart['Days'].max()
-        tick_vals = np.logspace(np.log10(days_min if days_min > 0 else 1), np.log10(days_max), num=10)
-        tick_vals = np.unique(np.round(tick_vals).astype(int))
-        tick_text = [(df_chart['Date'].min() + pd.Timedelta(days=val-1)).strftime('%Y-%m-%d') for val in tick_vals]
-        fig.update_xaxes(tickvals=tick_vals, ticktext=tick_text, row=1, col=1)
     else:
+        x_line = np.linspace(df['Days'].min(), df['Days'].max(), 100)
+        y_line = a_fit * (x_line ** slope_fit)
+        mask = y_line >= YFIT_MIN_PRICE
+        x_line = x_line[mask]; y_line = y_line[mask]
+        x_dates = [df['Date'].min() + pd.Timedelta(days=int(x)-1) for x in x_line]
+        fig.add_trace(
+            go.Scatter(
+                x=x_dates, y=y_line, mode='lines',
+                line=dict(color='gray', dash='dash'),
+                name='Power-Law Fit',
+                hovertemplate=HOVER_PRICE,
+                customdata=[d.strftime('%Y-%m-%d') for d in x_dates]
+            ), row=1, col=1
+        )
         fig.update_xaxes(type="date", row=1, col=1)
 
-    if axis_scale in ['log', 'loglog']:
-        fig.update_yaxes(type="log", row=1, col=1, autorange=True)
-    else:
-        fig.update_yaxes(type="linear", row=1, col=1, autorange=True)
+    # Y axis mode for price panel
+    fig.update_yaxes(type="log" if axis_scale in ['log', 'loglog'] else "linear", row=1, col=1, autorange=True)
 
-    # RSI Chart.
+    # 5) RSI panel with dynamic zones & segmented colors
     fig.add_trace(
         go.Scatter(
-            x=df_chart[x_axis_col],
-            y=df_chart['RSI'],
-            mode='lines',
-            line=dict(color='lightgray', width=1),
-            showlegend=False,
-            hovertemplate="Date: %{customdata}<br>RSI: %{y:.0f}<extra></extra>",
-            customdata=customdata_rsi
-        ),
-        row=2, col=1
+            x=df_chart[x_axis_col], y=df_chart['RSI'], mode='lines',
+            line=dict(color='lightgray', width=1), showlegend=False,
+            hovertemplate=HOVER_RSI,
+            customdata=dates_h(df_chart[x_axis_col])
+        ), row=2, col=1
     )
     df_rsi = df_chart.sort_values('Date').copy()
     df_rsi['Group'] = (df_rsi['RSI_class'] != df_rsi['RSI_class'].shift()).cumsum()
-    for _, group in df_rsi.groupby('Group'):
-        if axis_scale == 'loglog':
-            customdata_group = [(base_date + pd.Timedelta(days=int(x)-1)).strftime('%Y-%m-%d') for x in group[x_axis_col]]
-        else:
-            customdata_group = group['Date'].dt.strftime('%Y-%m-%d')
-        x_vals_rsi = group[x_axis_col]
+    for _, g in df_rsi.groupby('Group'):
         fig.add_trace(
             go.Scatter(
-                x=x_vals_rsi,
-                y=group['RSI'],
-                mode='lines',
-                line=dict(color=rsi_line_colors.get(group['RSI_class'].iloc[0], 'black')),
+                x=g[x_axis_col], y=g['RSI'], mode='lines',
+                line=dict(color=RSI_LINE_COLORS.get(g['RSI_class'].iloc[0], 'black')),
                 showlegend=False,
-                hovertemplate="Date: %{customdata}<br>RSI: %{y:.0f}<extra></extra>",
-                customdata=customdata_group
-            ),
-            row=2, col=1
+                hovertemplate=HOVER_RSI,
+                customdata=dates_h(g[x_axis_col])
+            ), row=2, col=1
         )
-    x_ref = df_chart['Date'].min() if axis_scale != 'loglog' else df_chart['Days'].min()
-    x_max_val = df_chart['Date'].max() if axis_scale != 'loglog' else df_chart['Days'].max()
-    # RSI zones
-    fig.add_shape(
-        type="rect",
-        xref="x", yref="y2",
-        x0=x_ref, x1=x_max_val,
-        y0=70, y1=100,
-        fillcolor="rgba(255,0,0,0.1)",
-        line_width=0,
-        layer="below",
-        row=2, col=1
-    )
-    fig.add_shape(
-        type="rect",
-        xref="x", yref="y2",
-        x0=x_ref, x1=x_max_val,
-        y0=0, y1=30,
-        fillcolor="rgba(0,255,0,0.1)",
-        line_width=0,
-        layer="below",
-        row=2, col=1
-    )
+
+    x0 = df_chart['Days'].min() if use_loglog else df_chart['Date'].min()
+    x1 = df_chart['Days'].max() if use_loglog else df_chart['Date'].max()
+
+    # Dynamic RSI zones
+    fig.add_shape(type="rect", xref="x", yref="y2", x0=x0, x1=x1, y0=rsi_ob, y1=100,
+                  fillcolor="rgba(255,0,0,0.1)", line_width=0, layer="below", row=2, col=1)
+    fig.add_shape(type="rect", xref="x", yref="y2", x0=x0, x1=x1, y0=0, y1=rsi_os,
+                  fillcolor="rgba(0,255,0,0.1)", line_width=0, layer="below", row=2, col=1)
+
     fig.update_yaxes(range=[0, 100], row=2, col=1)
-    if axis_scale == 'loglog':
-        fig.update_xaxes(type="log", row=2, col=1)
-        fig.update_xaxes(tickvals=tick_vals, ticktext=tick_text, row=2, col=1)
-    else:
-        fig.update_xaxes(type="date", row=2, col=1)
+    fig.update_xaxes(type="log" if use_loglog else "date", row=2, col=1)
 
     fig.update_layout(
         height=700,
@@ -681,62 +737,52 @@ def update_analytics(axis_scale, start_date, end_date, pair, price_field,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # Update x-axis range (zoom) and auto-adapt Price y-axis to the subset within the current date-range.
+    # Zoom to selected date range + tighten y-range on price
     if start_date and end_date:
-        # Clip start/end dates to available range just in case
-        s_date = pd.to_datetime(start_date)
-        e_date = pd.to_datetime(end_date)
-        data_min = df_local['Date'].min()
-        data_max = df_local['Date'].max()
-        s_date = max(s_date, data_min)
-        e_date = min(e_date, data_max)
-
-        if axis_scale == 'loglog':
-            d0 = df_local['Date'].min()
-            start_day = (s_date - d0).days + 1
-            end_day = (e_date - d0).days + 1
-            start_day = max(start_day, 1)
-            end_day = max(end_day, start_day + 1)
-            fig.update_xaxes(range=[np.log10(start_day), np.log10(end_day)], row=1, col=1)
-            fig.update_xaxes(range=[np.log10(start_day), np.log10(end_day)], row=2, col=1)
-            subset = df_local[(df_local['Days'] >= start_day) & (df_local['Days'] <= end_day)]
+        s_date = max(pd.to_datetime(start_date), df['Date'].min())
+        e_date = min(pd.to_datetime(end_date), df['Date'].max())
+        if use_loglog:
+            d0 = df['Date'].min()
+            s_day = max((s_date - d0).days + 1, 1)
+            e_day = max((e_date - d0).days + 1, s_day + 1)
+            fig.update_xaxes(range=[np.log10(s_day), np.log10(e_day)], row=1, col=1)
+            fig.update_xaxes(range=[np.log10(s_day), np.log10(e_day)], row=2, col=1)
+            subset = df[(df['Days'] >= s_day) & (df['Days'] <= e_day)]
         else:
             fig.update_xaxes(range=[s_date, e_date], row=1, col=1)
             fig.update_xaxes(range=[s_date, e_date], row=2, col=1)
-            subset = df_local[(df_local['Date'] >= s_date) & (df_local['Date'] <= e_date)]
+            subset = df[(df['Date'] >= s_date) & (df['Date'] <= e_date)]
         if not subset.empty:
             if axis_scale in ['log', 'loglog']:
-                log_ymin = np.log10(subset[price_col].min())
-                log_ymax = np.log10(subset[price_col].max())
-                margin_log = (log_ymax - log_ymin) * 0.05
-                new_y_range = [log_ymin - margin_log, log_ymax + margin_log]
-                fig.update_yaxes(range=new_y_range, row=1, col=1)
+                y0, y1 = np.log10(subset[price_col].min()), np.log10(subset[price_col].max())
+                pad = (y1 - y0) * 0.05
+                fig.update_yaxes(range=[y0 - pad, y1 + pad], row=1, col=1)
             else:
-                ymin = subset[price_col].min()
-                ymax = subset[price_col].max()
-                margin = (ymax - ymin) * 0.05
-                new_y_range = [ymin - margin, ymax + margin]
-                fig.update_yaxes(range=new_y_range, row=1, col=1)
+                y0, y1 = subset[price_col].min(), subset[price_col].max()
+                pad = (y1 - y0) * 0.05
+                fig.update_yaxes(range=[y0 - pad, y1 + pad], row=1, col=1)
 
-    debug_text = (f"Pair: {pair} | Data from {df_local['Date'].min().date()} to {df_local['Date'].max().date()} | "
-                  f"Price Field: {price_field}, Short-term MA: {short_ma_window}d, Long-term MA: {long_ma_window}w, "
-                  f"RSI thresholds: oversold < {rsi_os}, overbought > {rsi_ob}")
-    quarterly_title = f"Quarterly Price Predictions (Power-Law: y = {a_local:.2e} · (days)^({slope_local:.2e}))"
+    # Debug & strategy text
+    debug_text = (f"Pair: {pair} | Data {df['Date'].min().date()} → {df['Date'].max().date()} | "
+                  f"Price: {price_field} | ST-MA: {short_ma_window}d | LT-MA: {long_ma_window}w | "
+                  f"RSI: oversold < {rsi_os}, overbought > {rsi_ob}")
 
-    dynamic_strategy = f"""
+    # Human-readable power-law header
+    pl_readable = fmt_power_law_readable(a_fit, slope_fit)
+    q_title = f"Quarterly Price Predictions — Power-Law Fit: {pl_readable}"
+
+    strategy_md = f"""
 **Trading Strategy:**  
 - **Short-term:** Buy if *{price_field}* < Short-Term MA and RSI < {rsi_os}%; Sell if *{price_field}* > Short-Term MA and RSI > {rsi_ob}%.  
 - **Long-term:** Buy if *{price_field}* < Long-Term MA and RSI < {rsi_os}%.  
-Short-Term MA = {format_duration_in_days(short_ma_window)}; Long-Term MA = {format_duration_in_days(long_ma_window * 7)}.  
+Short-Term MA = {fmt_duration_days(short_ma_window)}; Long-Term MA = {fmt_duration_days(long_ma_window * 7)}.  
 Bubble size ∝ |Price − MA|, max size = 10× line thickness × marker-scale.
 """
 
-    return fig, df_predictions_new.to_dict('records'), quarterly_title, debug_text, dynamic_strategy
+    return fig, df_preds.to_dict('records'), q_title, debug_text, strategy_md
 
-
-
-# --------------------------
-# Run the App
-# --------------------------
+# =========================
+# Entrypoint
+# =========================
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=False, port=8050)
